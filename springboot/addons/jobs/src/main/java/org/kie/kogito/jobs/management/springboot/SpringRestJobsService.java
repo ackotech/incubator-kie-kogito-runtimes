@@ -48,7 +48,7 @@ public class SpringRestJobsService extends RestJobsService {
     @Autowired
     public SpringRestJobsService(
             @Value("${kogito.jobs-service.url}") String jobServiceUrl,
-            @Value("${kogito.service.url}") String callbackEndpoint,
+            @Value("${kogito.service.internal_url}") String callbackEndpoint,
             @Autowired(required = false) RestTemplate restTemplate,
             @Autowired ObjectMapper objectMapper) {
         super(jobServiceUrl, callbackEndpoint, objectMapper);
