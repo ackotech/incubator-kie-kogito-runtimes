@@ -20,6 +20,8 @@ package org.kie.kogito.codegen.process.persistence.marshaller;
 
 import java.io.IOException;
 import java.io.Serializable;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -52,21 +54,10 @@ import org.kie.kogito.codegen.process.persistence.ExclusionTypeUtils;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.NodeList;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.VariableDeclarator;
-import com.github.javaparser.ast.expr.BinaryExpr;
-import com.github.javaparser.ast.expr.CastExpr;
-import com.github.javaparser.ast.expr.ClassExpr;
-import com.github.javaparser.ast.expr.EnclosedExpr;
-import com.github.javaparser.ast.expr.Expression;
-import com.github.javaparser.ast.expr.IntegerLiteralExpr;
-import com.github.javaparser.ast.expr.MethodCallExpr;
-import com.github.javaparser.ast.expr.NameExpr;
-import com.github.javaparser.ast.expr.NullLiteralExpr;
-import com.github.javaparser.ast.expr.ObjectCreationExpr;
-import com.github.javaparser.ast.expr.SimpleName;
-import com.github.javaparser.ast.expr.StringLiteralExpr;
-import com.github.javaparser.ast.expr.VariableDeclarationExpr;
+import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.ast.stmt.BlockStmt;
 import com.github.javaparser.ast.stmt.IfStmt;
 import com.github.javaparser.ast.stmt.ReturnStmt;
@@ -77,7 +68,6 @@ import com.github.javaparser.ast.type.ClassOrInterfaceType;
 
 import static com.github.javaparser.ast.Modifier.Keyword.PUBLIC;
 import static com.github.javaparser.ast.expr.BinaryExpr.Operator.EQUALS;
-import static java.lang.String.format;
 import static org.kie.kogito.codegen.process.persistence.proto.ProtoGenerator.KOGITO_JAVA_CLASS_OPTION;
 
 public abstract class AbstractMarshallerGenerator<T> implements MarshallerGenerator {
@@ -92,12 +82,42 @@ public abstract class AbstractMarshallerGenerator<T> implements MarshallerGenera
     public AbstractMarshallerGenerator(KogitoBuildContext context, Collection<T> rawDataClasses) {
         this.context = context;
         this.modelClasses = rawDataClasses == null ? Collections.emptyList() : rawDataClasses;
+        System.out.println("******* " + this.getClass().getName());
     }
 
     @Override
     public List<CompilationUnit> generate(String content) throws IOException {
         FileDescriptorSource proto = FileDescriptorSource.fromString(UUID.randomUUID().toString(), content);
         return generate(proto);
+    }
+
+    /**
+     * As of now it does not check for a overloaded method with different types. We can now ignore it as
+     * we are using it for checking getters and setters only
+     * 
+     * @param methodName
+     * @param clazz
+     * @return
+     */
+    public boolean isMethodPublicAndPresent(String methodName, Class<?> clazz) {
+        try {
+            // Get all methods of the class
+            for (Method method : clazz.getMethods()) {
+                // Check if the method name matches and is public
+                if (method.getName().equals(methodName) && Modifier.isPublic(method.getModifiers())) {
+                    return true;
+                }
+            }
+        } catch (SecurityException e) {
+            //ignore
+        }
+        return false;
+    }
+
+    public boolean isMethodPublicAndPresent(MethodCallExpr methodCallExpr, Class<?> clazz) {
+        String methodName = methodCallExpr.getNameAsString();
+
+        return isMethodPublicAndPresent(methodName, clazz);
     }
 
     public List<CompilationUnit> generate(FileDescriptorSource proto) throws IOException {
@@ -125,11 +145,13 @@ public abstract class AbstractMarshallerGenerator<T> implements MarshallerGenera
         Map<String, FileDescriptor> descriptors = serializationContext.getFileDescriptors();
 
         for (Entry<String, FileDescriptor> entry : descriptors.entrySet()) {
+            System.out.println("*** entry " + entry);
 
             FileDescriptor d = entry.getValue();
             List<Descriptor> messages = d.getMessageTypes().stream().filter(predicate).collect(Collectors.toList());
 
             for (Descriptor msg : messages) {
+                System.out.println("*** message " + msg);
 
                 CompilationUnit clazzFile = parsedClazzFile.clone();
                 units.add(clazzFile);
@@ -141,6 +163,7 @@ public abstract class AbstractMarshallerGenerator<T> implements MarshallerGenera
                         .orElseThrow(() -> new InvalidTemplateException(generator, "No class found"));
                 clazz.setName(msg.getName() + "MessageMarshaller");
                 clazz.getImplementedTypes(0).setTypeArguments(NodeList.nodeList(new ClassOrInterfaceType(null, javaType)));
+                boolean addedObjectMapper = false;
 
                 MethodDeclaration getJavaClassMethod =
                         clazz.findFirst(MethodDeclaration.class, md -> md.getNameAsString().equals("getJavaClass"))
@@ -172,27 +195,80 @@ public abstract class AbstractMarshallerGenerator<T> implements MarshallerGenera
                 ClassOrInterfaceType classType = new ClassOrInterfaceType(null, javaType);
 
                 // read method
-                VariableDeclarationExpr instance = new VariableDeclarationExpr(new VariableDeclarator(classType, "value", new ObjectCreationExpr(null, classType, NodeList.nodeList())));
-                readFromMethod.getBody().ifPresent(b -> b.addStatement(instance));
+
+                Class<?> javaClazz = null;
+                boolean classIsAbstract = false;
+                try {
+                    javaClazz = Class.forName(javaType);
+                    classIsAbstract = Modifier.isAbstract(javaClazz.getModifiers()) || javaClazz.isInterface();
+                } catch (ClassNotFoundException e) {
+                    System.out.println("Not able to check class name " + javaType);
+                }
+
+                if (javaType.equals(Serializable.class.getName()) || classIsAbstract) {
+                    //TODO
+                    System.out.println("$$$$$$$$$$$$$$$$$#@ Serializable/Abstract " + javaType + " Need to add statements");
+
+                    // Add a static ObjectMapper field
+                    this.addObjectMapperToClass(clazz);
+                    addedObjectMapper = true;
+
+                    /*
+                     * Read body
+                     * Serializable value = objectMapper.readValue(reader.readString("obj"), Serializable.class);
+                     */
+                    MethodCallExpr deserialiseWithJackson = new MethodCallExpr(new NameExpr("objectMapper"), "readValue")
+                            .addArgument(new MethodCallExpr(new NameExpr("reader"), "readString")
+                                    .addArgument(new StringLiteralExpr("obj")))
+                            .addArgument(new NameExpr(javaType + ".class"));
+                    VariableDeclarationExpr instance = new VariableDeclarationExpr(new VariableDeclarator(classType,
+                            "value", deserialiseWithJackson));
+                    readFromMethod.getBody().ifPresent(b -> b.addStatement(instance));
+
+                    /*
+                     * Write body
+                     * writer.writeString("obj", objectMapper.writeValueAsString(t));
+                     */
+                    MethodCallExpr serializeWithJackson = new MethodCallExpr(new NameExpr("objectMapper"), "writeValueAsString")
+                            .addArgument(new NameExpr("t"));
+                    MethodCallExpr write = new MethodCallExpr(new NameExpr("writer"), "writeString")
+                            .addArgument(new StringLiteralExpr("obj"))
+                            .addArgument(serializeWithJackson);
+                    // write method
+                    writeToMethod
+                            .getBody()
+                            .orElseThrow(() -> new NoSuchElementException("A method declaration doesn't contain a body!"))
+                            .addStatement(write);
+                } else {
+                    VariableDeclarationExpr instance = new VariableDeclarationExpr(new VariableDeclarator(classType,
+                            "value", new ObjectCreationExpr(null, classType, NodeList.nodeList())));
+                    readFromMethod.getBody().ifPresent(b -> b.addStatement(instance));
+                }
 
                 for (FieldDescriptor field : msg.getFields()) {
+                    System.out.println("*** field " + field);
 
                     String protoStreamMethodType = protoStreamMethodType(field.getTypeName());
                     Expression write = null;
                     Expression read = null;
+                    String getterMethodName = null;
                     if (protoStreamMethodType != null && !field.isRepeated()) {
+
                         // has a mapped type
                         read = new MethodCallExpr(new NameExpr("reader"), "read" + protoStreamMethodType)
                                 .addArgument(new StringLiteralExpr(field.getName()));
                         String accessor = protoStreamMethodType.equals("Boolean") ? "is" : "get";
+                        getterMethodName = accessor + StringUtils.ucFirst(field.getName());
                         write = new MethodCallExpr(new NameExpr("writer"), "write" + protoStreamMethodType)
                                 .addArgument(new StringLiteralExpr(field.getName()))
-                                .addArgument(new MethodCallExpr(new NameExpr("t"), accessor + StringUtils.ucFirst(field.getName())));
+                                .addArgument(new MethodCallExpr(new NameExpr("t"), getterMethodName));
                     } else {
+                        //                        System.out.println("## field : " + field.getName() + " else custom types");
                         // custom types 
                         String customTypeName = javaTypeForMessage(d, field.getTypeName(), serializationContext);
-
+                        getterMethodName = "get" + StringUtils.ucFirst(field.getName());
                         if (field.isRepeated()) {
+                            //                            System.out.println("## field : " + field.getName() + " repeated");
                             if (null == customTypeName || customTypeName.isEmpty()) {
                                 customTypeName = primaryTypeClassName(field.getTypeName());
                             }
@@ -200,11 +276,13 @@ public abstract class AbstractMarshallerGenerator<T> implements MarshallerGenera
                             String writeMethod;
 
                             if (isArray(javaType, field)) {
+                                //                                System.out.println("## field : " + field.getName() + " array");
                                 writeMethod = "writeArray";
                                 read = new MethodCallExpr(new NameExpr("reader"), "readArray")
                                         .addArgument(new StringLiteralExpr(field.getName()))
                                         .addArgument(new NameExpr(customTypeName + ".class"));
                             } else {
+                                //                                System.out.println("## field : " + field.getName() + " not array but repeated");
                                 writeMethod = "writeCollection";
                                 read = new MethodCallExpr(new NameExpr("reader"), "readCollection")
                                         .addArgument(new StringLiteralExpr(field.getName()))
@@ -214,47 +292,99 @@ public abstract class AbstractMarshallerGenerator<T> implements MarshallerGenera
 
                             write = new MethodCallExpr(new NameExpr("writer"), writeMethod)
                                     .addArgument(new StringLiteralExpr(field.getName()))
-                                    .addArgument(new MethodCallExpr(new NameExpr("t"), "get" + StringUtils.ucFirst(field.getName())))
+                                    .addArgument(new MethodCallExpr(new NameExpr("t"), getterMethodName))
                                     .addArgument(new NameExpr(customTypeName + ".class"));
                         } else {
-
-                            read = new MethodCallExpr(new NameExpr("reader"), "readObject")
-                                    .addArgument(new StringLiteralExpr(field.getName()))
-                                    .addArgument(new NameExpr(customTypeName + ".class"));
-                            write = new MethodCallExpr(new NameExpr("writer"), "writeObject")
-                                    .addArgument(new StringLiteralExpr(field.getName()))
-                                    .addArgument(new MethodCallExpr(new NameExpr("t"), "get" + StringUtils.ucFirst(field.getName())))
-                                    .addArgument(new NameExpr(customTypeName + ".class"));
-                        }
-
-                        if (customTypeName.equals(Serializable.class.getName())) {
-                            String fieldClazz = (String) field.getOptionByName(KOGITO_JAVA_CLASS_OPTION);
-                            if (fieldClazz == null) {
-                                throw new IllegalArgumentException(format("Serializable proto field '%s' is missing value for option %s", field.getName(), KOGITO_JAVA_CLASS_OPTION));
-                            } else {
-                                read = new CastExpr().setExpression(new EnclosedExpr(read)).setType(fieldClazz);
-                                int argumentIndex = 1;
-                                MethodCallExpr writeMethod = null;
-                                if (write instanceof MethodCallExpr &&
-                                        (writeMethod = (MethodCallExpr) write).getArguments() != null &&
-                                        writeMethod.getArguments().size() > argumentIndex) {
-                                    Expression argument = writeMethod.getArgument(argumentIndex);
-                                    write = writeMethod.setArgument(
-                                            argumentIndex,
-                                            new CastExpr().setExpression(new EnclosedExpr(argument)).setType(fieldClazz));
+                            //                            System.out.println("## field : " + field.getName() + " not repeated " + javaClazz);
+                            Class<?> fieldJavaClazz = null;
+                            //                            int modifiers;
+                            boolean isAbstract = false;
+                            try {
+                                fieldJavaClazz = Class.forName(customTypeName);
+                                //                                modifiers = fieldJavaClazz.getModifiers();
+                                //                                System.out.println("$$$$$$   isAbstract " + Modifier.isAbstract(modifiers) + " isinterface " + fieldJavaClazz.isInterface());
+                                //                                System.out.println("## original instance " + instanceOld);
+                                isAbstract = Modifier.isAbstract(fieldJavaClazz.getModifiers()) || fieldJavaClazz.isInterface();
+                            } catch (ClassNotFoundException e) {
+                                // isAbstract is false
+                            }
+                            if (isAbstract) {
+                                //                                System.out.println("## field : " + field.getName() + " jackson");
+                                if (!addedObjectMapper) {
+                                    // Add a static ObjectMapper field
+                                    this.addObjectMapperToClass(clazz);
+                                    addedObjectMapper = true;
                                 }
+                                String fieldClazz = (String) field.getOptionByName(KOGITO_JAVA_CLASS_OPTION);
+                                if (fieldClazz == null) {
+                                    throw new IllegalArgumentException(String.format("Serializable proto field '%s' is missing value for option %s", field.getName(), KOGITO_JAVA_CLASS_OPTION));
+                                }
+                                // Use Jackson for serialization/deserialization
+                                MethodCallExpr serializeWithJackson = new MethodCallExpr(new NameExpr("objectMapper"), "writeValueAsString")
+                                        .addArgument(new MethodCallExpr(new NameExpr("t"), getterMethodName));
+
+                                write = new MethodCallExpr(new NameExpr("writer"), "writeString")
+                                        .addArgument(new StringLiteralExpr(field.getName()))
+                                        .addArgument(serializeWithJackson);
+
+                                read = new MethodCallExpr(new NameExpr("objectMapper"), "readValue")
+                                        .addArgument(new MethodCallExpr(new NameExpr("reader"), "readString").addArgument(new StringLiteralExpr(field.getName())))
+                                        .addArgument(new NameExpr(fieldClazz + ".class"));
+
+                            } else {
+                                //                                System.out.println("## field : " + field.getName() + " Object");
+                                read = new MethodCallExpr(new NameExpr("reader"), "readObject")
+                                        .addArgument(new StringLiteralExpr(field.getName()))
+                                        .addArgument(new NameExpr(customTypeName + ".class"));
+                                write = new MethodCallExpr(new NameExpr("writer"), "writeObject")
+                                        .addArgument(new StringLiteralExpr(field.getName()))
+                                        .addArgument(new MethodCallExpr(new NameExpr("t"), getterMethodName))
+                                        .addArgument(new NameExpr(customTypeName + ".class"));
                             }
                         }
+
+                        /*
+                         * if (customTypeName.equals(Serializable.class.getName())) {
+                         * 
+                         * String fieldClazz = (String) field.getOptionByName(KOGITO_JAVA_CLASS_OPTION);
+                         * System.out.println("$$$$$$$$$$$$$$$$$#@ Serializable " + fieldClazz);
+                         * if (fieldClazz == null) {
+                         * throw new IllegalArgumentException(String.format("Serializable proto field '%s' is missing value for option %s", field.getName(), KOGITO_JAVA_CLASS_OPTION));
+                         * } else {
+                         * //read = new CastExpr().setExpression(new EnclosedExpr(read)).setType(fieldClazz);
+                         * int argumentIndex = 1;
+                         * MethodCallExpr writeMethod = null;
+                         * if (write instanceof MethodCallExpr &&
+                         * (writeMethod = (MethodCallExpr) write).getArguments() != null &&
+                         * writeMethod.getArguments().size() > argumentIndex) {
+                         * Expression argument = writeMethod.getArgument(argumentIndex);
+                         * System.out.println(writeMethod.setArgument(
+                         * argumentIndex,
+                         * new CastExpr().setExpression(new EnclosedExpr(argument)).setType(fieldClazz)));
+                         * }
+                         * }
+                         * }
+                         */
                     }
 
                     MethodCallExpr setter = new MethodCallExpr(new NameExpr("value"), "set" + StringUtils.ucFirst(field.getName())).addArgument(read);
-                    readFromMethod.getBody().ifPresent(b -> b.addStatement(setter));
+                    // if the getter or setter is not present for a particular object then we should ignore this
+                    boolean isSetterPresent = javaClazz == null || this.isMethodPublicAndPresent(setter, javaClazz);
+                    boolean isGetterPresent = javaClazz == null || this.isMethodPublicAndPresent(getterMethodName, javaClazz);
 
-                    // write method
-                    writeToMethod
-                            .getBody()
-                            .orElseThrow(() -> new NoSuchElementException("A method declaration doesn't contain a body!"))
-                            .addStatement(write);
+                    if (isSetterPresent && isGetterPresent) {
+                        System.out.println("## field : " + field.getName() + " setter & getter present");
+
+                        readFromMethod.getBody().ifPresent(b -> b.addStatement(setter));
+                        //                    System.out.println("&&&&&&& Read " + read);
+                        //                    System.out.println("&&&&&&& Write " + write);
+
+                        // write method
+                        writeToMethod
+                                .getBody()
+                                .orElseThrow(() -> new NoSuchElementException("A method declaration doesn't contain a body!"))
+                                .addStatement(write);
+                    }
                 }
 
                 readFromMethod.getBody().ifPresent(b -> b.addStatement(new ReturnStmt(new NameExpr("value"))));
@@ -312,6 +442,7 @@ public abstract class AbstractMarshallerGenerator<T> implements MarshallerGenera
                 decode.setBody(new BlockStmt().addStatement(decodeSwitch));
             }
         }
+        System.out.println("@@@@@@@@ Compilation Units " + units);
 
         return units;
     }
@@ -412,6 +543,21 @@ public abstract class AbstractMarshallerGenerator<T> implements MarshallerGenera
         }
 
         return className;
+    }
+
+    private void addObjectMapperToClass(ClassOrInterfaceDeclaration clazz) {
+        // Add a static ObjectMapper field
+        FieldDeclaration objectMapperField = new FieldDeclaration()
+                .addVariable(new VariableDeclarator(
+                        new ClassOrInterfaceType(null, "com.fasterxml.jackson.databind.ObjectMapper"),
+                        "objectMapper",
+                        new ObjectCreationExpr(null, new ClassOrInterfaceType(null, "com.fasterxml.jackson.databind.ObjectMapper"), NodeList.nodeList())))
+                .setModifiers(com.github.javaparser.ast.Modifier.Keyword.PRIVATE,
+                        com.github.javaparser.ast.Modifier.Keyword.STATIC,
+                        com.github.javaparser.ast.Modifier.Keyword.FINAL);
+
+        // Add the field to the class
+        clazz.addMember(objectMapperField);
     }
 
     protected abstract boolean isArray(String javaType, FieldDescriptor field);
